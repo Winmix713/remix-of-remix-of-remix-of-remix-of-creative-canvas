@@ -9,7 +9,7 @@ import {
 /* CONFIG                                                                     */
 /* -------------------------------------------------------------------------- */
 
-const GEMINI_MODEL = 'gemini-3.6-flash';
+const GEMINI_MODEL = 'gemini-3.6-flash-lite';
 
 const GEMINI_ENDPOINT =
   `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
@@ -49,7 +49,7 @@ const MAX_RETRY_AFTER_MS = 15_000;
  * Even if React causes several payload changes in quick succession,
  * Gemini will not receive those requests back-to-back.
  */
-const MIN_REQUEST_INTERVAL_MS = 15_000;
+const MIN_REQUEST_INTERVAL_MS = 30_000;
 
 /**
  * After a 429 response we temporarily close the Conductor circuit.
