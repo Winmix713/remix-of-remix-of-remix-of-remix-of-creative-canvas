@@ -33,10 +33,11 @@ export interface SyntheticOptions {
   h2hStrength?: number;
   /**
    * Goal-generation mode:
-   *  - 'poisson'  — independent Poisson scores (default)
-   *  - 'overdisp' — extra goals injected to produce variance > mean
+   *  - 'poisson'   — independent Poisson scores (default)
+   *  - 'overdisp'  — extra goals injected to produce variance > mean
+   *  - 'underdisp' — compressed goal counts to produce variance < mean
    */
-  goalMode?: 'poisson' | 'overdisp';
+  goalMode?: 'poisson' | 'overdisp' | 'underdisp';
   /**
    * Per-season strength drift applied when building multiple seasons. Each
    * season's strengths are shifted by `drift * seasonIndex`, so a non-zero
@@ -160,6 +161,37 @@ export function makeSyntheticSeason(
       const lambdaAway = Math.exp(0.3 - 0.4 * z);
       homeScore = poissonSample(rand, lambdaHome);
       awayScore = poissonSample(rand, lambdaAway);
+    } else if (goalMode === 'underdisp') {
+      // Under-dispersed: compress goals toward the mean, reducing variance.
+      // Sample from a narrow band around the expected mean, clamped tight.
+      const lambdaHome = Math.exp(0.3 + 0.4 * z);
+      const lambdaAway = Math.exp(0.3 - 0.4 * z);
+      const rawHome = poissonSample(rand, lambdaHome);
+      const rawAway = poissonSample(rand, lambdaAway);
+      // Shrink toward the mean: 70% of the time use the rounded mean, 30% use raw.
+      const meanTotal = lambdaHome + lambdaAway;
+      const useMean = rand() < 0.7;
+      if (useMean) {
+        homeScore = Math.round(lambdaHome);
+        awayScore = Math.round(lambdaAway);
+      } else {
+        homeScore = rawHome;
+        awayScore = rawAway;
+      }
+      // Clamp to a narrow band around the expected total to reduce variance.
+      const total = homeScore + awayScore;
+      const expectedTotal = Math.round(meanTotal);
+      if (total > expectedTotal + 1) {
+        const excess = total - (expectedTotal + 1);
+        if (homeScore > awayScore) homeScore -= excess;
+        else awayScore -= excess;
+      } else if (total < expectedTotal - 1) {
+        const deficit = (expectedTotal - 1) - total;
+        homeScore += Math.ceil(deficit / 2);
+        awayScore += Math.floor(deficit / 2);
+      }
+      if (homeScore < 0) homeScore = 0;
+      if (awayScore < 0) awayScore = 0;
     } else {
       // Outcome-conditioned with heavy tail to inflate variance beyond Poisson.
       const base = outcome === 'H' ? 1 : outcome === 'A' ? 0 : 0;
@@ -173,7 +205,7 @@ export function makeSyntheticSeason(
 
     // In Poisson mode the outcome comes from the actual scores; in overdisp
     // mode the outcome was already determined by the probability model.
-    const finalOutcome: Outcome = goalMode === 'poisson'
+    const finalOutcome: Outcome = (goalMode === 'poisson' || goalMode === 'underdisp')
       ? (homeScore > awayScore ? 'H' : homeScore < awayScore ? 'A' : 'D')
       : outcome;
 
