@@ -1,0 +1,4 @@
+project_id = "oaadhaapbgzyibyadgdh"
+
+[functions.winmix-ingest]
+verify_jwt = false
