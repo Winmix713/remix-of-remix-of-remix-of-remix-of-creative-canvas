@@ -5,8 +5,8 @@ import { useWinmix } from '../contexts/WinmixContext';
 import { computeAutoTeamWeights, weightDelta } from '../utils/autoWeights';
 import { DEFAULT_WEIGHT } from '../utils/constants';
 import { checkDirectedFixtureMatrix } from '../utils/fixtureMatrix';
-import { ingestSeasonsToCloud, type IngestResult } from '../utils/supabaseTier';
-import type { HistoryScope } from '../types/winmix';
+import { ingestSeasonsToCloud, downloadSeasonsFromCloud, type IngestResult, type DownloadResult } from '../utils/supabaseTier';
+import type { HistoryScope, League } from '../types/winmix';
 
 type AutoWeightMap = ReturnType<typeof computeAutoTeamWeights>;
 type AutoWeight = AutoWeightMap[string];
@@ -51,7 +51,8 @@ export function useOpsActions() {
     saveWeights,
     settings,
     updateSettings,
-    rebuildFromScratch
+    rebuildFromScratch,
+    beginImport
   } = useWinmix();
   const dialogs = useDialogs();
   const cloud = useCloudTierContext();
@@ -65,6 +66,8 @@ export function useOpsActions() {
   const [autoAppliedKeys, setAutoAppliedKeys] = useState<Set<string>>(() => new Set());
   const [ingesting, setIngesting] = useState(false);
   const [ingestResult, setIngestResult] = useState<IngestResult | null>(null);
+  const [downloading, setDownloading] = useState(false);
+  const [downloadResult, setDownloadResult] = useState<DownloadResult | null>(null);
 
   const aliases = teamAliasMap[currentLeague] ?? {};
   const activeWeights = teamWeights[currentLeague] ?? {};
@@ -228,6 +231,31 @@ export function useOpsActions() {
     }
   }, [seasons, teamWeights, teamAliasMap, dialogs, cloud, currentLeague]);
 
+  const downloadFromCloud = useCallback(async (league: League) => {
+    const ok = await dialogs.confirm(
+      `Szezonok letöltése a felhőből (${league.toUpperCase()})? ` +
+      `A letöltött adatok az import előnézetben jelennek meg.`
+    );
+    if (!ok) return;
+
+    setDownloading(true);
+    setDownloadResult(null);
+    try {
+      const result = await downloadSeasonsFromCloud(league);
+      setDownloadResult(result);
+      if (result.failures.length === 0 && result.seasons > 0) {
+        const raw = sessionStorage.getItem('winmix_cloud_download');
+        if (raw) {
+          sessionStorage.removeItem('winmix_cloud_download');
+          const file = new File([raw], 'cloud-download.json', { type: 'application/json' });
+          await beginImport(file);
+        }
+      }
+    } finally {
+      setDownloading(false);
+    }
+  }, [dialogs, beginImport]);
+
   return {
     auto,
     rows,
@@ -242,6 +270,9 @@ export function useOpsActions() {
     setWeight,
     ingestToCloud,
     ingesting,
-    ingestResult
+    ingestResult,
+    downloadFromCloud,
+    downloading,
+    downloadResult
   };
 }

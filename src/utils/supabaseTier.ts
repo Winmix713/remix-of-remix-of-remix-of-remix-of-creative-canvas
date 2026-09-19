@@ -312,3 +312,169 @@ export async function ingestSeasonsToCloud(params: {
     window.clearTimeout(timer);
   }
 }
+
+export interface DownloadResult {
+  seasons: number;
+  matches: number;
+  failures: string[];
+}
+
+/**
+ * Downloads seasons + matches from the Supabase cloud tier (winmix_seasons +
+ * winmix_matches) via the anon-key REST API and converts them into the Season[]
+ * shape the WinMix engine expects. Read-only, RLS-gated.
+ */
+export async function downloadSeasonsFromCloud(league: League): Promise<DownloadResult> {
+  const env = readEnv();
+  if (!env) {
+    return { seasons: 0, matches: 0, failures: ['A felhő tier nincs konfigurálva.'] };
+  }
+
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), 30000);
+
+  try {
+    const headers: Record<string, string> = {
+      apikey: env.anonKey,
+      Accept: 'application/json',
+    };
+    if (!isOpaqueKey(env.anonKey)) {
+      headers.Authorization = `Bearer ${env.anonKey}`;
+    }
+
+    const seasonRes = await fetch(
+      `${env.url}/rest/v1/winmix_seasons?league=eq.${encodeURIComponent(league)}&select=id,league,season_index,name,file_name,created_at,content_hash,order_mode,match_count`,
+      { method: 'GET', headers, signal: controller.signal },
+    );
+
+    if (!seasonRes.ok) {
+      const detail = await readPostgrestDetail(seasonRes);
+      return {
+        seasons: 0,
+        matches: 0,
+        failures: [`winmix_seasons: ${describeHttpError(seasonRes.status, seasonRes.statusText)}${detail}`],
+      };
+    }
+
+    const seasonRows = await seasonRes.json();
+    if (!Array.isArray(seasonRows) || seasonRows.length === 0) {
+      return { seasons: 0, matches: 0, failures: [] };
+    }
+
+    const seasonIds = seasonRows.map((r: Record<string, unknown>) => r.id);
+    const matchRes = await fetch(
+      `${env.url}/rest/v1/winmix_matches?season_id=in.(${seasonIds.map(encodeURIComponent).join(',')})&select=season_id,match_no,date,match_date_raw,kickoff_iso,row_index,source_file_id,home_team_id,away_team_id,ht_home_score,ht_away_score,home_score,away_score,total_goals,btts,outcome,league`,
+      { method: 'GET', headers, signal: controller.signal },
+    );
+
+    if (!matchRes.ok) {
+      const detail = await readPostgrestDetail(matchRes);
+      return {
+        seasons: 0,
+        matches: 0,
+        failures: [`winmix_matches: ${describeHttpError(matchRes.status, matchRes.statusText)}${detail}`],
+      };
+    }
+
+    const matchRows = await matchRes.json();
+    if (!Array.isArray(matchRows)) {
+      return { seasons: 0, matches: 0, failures: ['Érvénytelen válasz a szerverről.'] };
+    }
+
+    // Group matches by season_id
+    const matchesBySeason = new Map<string, unknown[]>();
+    for (const m of matchRows) {
+      const sid = (m as Record<string, unknown>).season_id;
+      if (typeof sid !== 'string') continue;
+      const bucket = matchesBySeason.get(sid);
+      if (bucket) {
+        bucket.push(m);
+      } else {
+        matchesBySeason.set(sid, [m]);
+      }
+    }
+
+    // Build Season[] in the engine's format
+    const seasons: Array<{
+      id: string;
+      league: League;
+      seasonIndex: number;
+      name: string;
+      fileName: string;
+      createdAt: string;
+      contentHash: string | null;
+      orderMode: string;
+      matches: Array<{
+        match_no: number;
+        date: string;
+        kickoffIso: string | null;
+        rowIndex: number | null;
+        sourceFileId: string | null;
+        home_team: string;
+        away_team: string;
+        ht_home_score: number | null;
+        ht_away_score: number | null;
+        home_score: number;
+        away_score: number;
+      }>;
+    }> = [];
+
+    let totalMatches = 0;
+
+    for (const sr of seasonRows as Record<string, unknown>[]) {
+      const sid = String(sr.id ?? '');
+      const rawMatches = matchesBySeason.get(sid) ?? [];
+
+      const matches = rawMatches.map((m: Record<string, unknown>) => ({
+        match_no: num(m.match_no),
+        date: String(m.match_date_raw ?? m.date ?? ''),
+        kickoffIso: typeof m.kickoff_iso === 'string' ? m.kickoff_iso : null,
+        rowIndex: typeof m.row_index === 'number' ? m.row_index : null,
+        sourceFileId: typeof m.source_file_id === 'string' ? m.source_file_id : null,
+        home_team: String(m.home_team_id ?? ''),
+        away_team: String(m.away_team_id ?? ''),
+        ht_home_score: typeof m.ht_home_score === 'number' ? m.ht_home_score : null,
+        ht_away_score: typeof m.ht_away_score === 'number' ? m.ht_away_score : null,
+        home_score: num(m.home_score),
+        away_score: num(m.away_score),
+      }));
+
+      totalMatches += matches.length;
+
+      seasons.push({
+        id: sid,
+        league: String(sr.league) as League,
+        seasonIndex: num(sr.season_index),
+        name: String(sr.name ?? ''),
+        fileName: String(sr.file_name ?? ''),
+        createdAt: String(sr.created_at ?? new Date().toISOString()),
+        contentHash: typeof sr.content_hash === 'string' ? sr.content_hash : null,
+        orderMode: String(sr.order_mode ?? 'chronological'),
+        matches,
+      });
+    }
+
+    // Store in sessionStorage for the ops hook to pick up
+    const payload = {
+      schemaVersion: 1,
+      exportedAt: new Date().toISOString(),
+      settings: null,
+      calibration: {},
+      teamWeights: {},
+      teamAliasMap: {},
+      seasonCounters: {},
+      seasons,
+    };
+    sessionStorage.setItem('winmix_cloud_download', JSON.stringify(payload));
+
+    return { seasons: seasons.length, matches: totalMatches, failures: [] };
+  } catch (e) {
+    return {
+      seasons: 0,
+      matches: 0,
+      failures: [e instanceof Error ? e.message : String(e)],
+    };
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
