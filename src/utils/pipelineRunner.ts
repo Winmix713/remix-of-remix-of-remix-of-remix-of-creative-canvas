@@ -19,26 +19,54 @@ import type { WorkerRequest, WorkerResponse } from '../workers/pipeline.worker';
 
 export type PipelineRunMode = 'worker' | 'inline';
 
-let worker: Worker | null | undefined;
+const MAX_WORKERS =
+  typeof navigator !== 'undefined'
+    ? Math.max(1, Math.min(4, navigator.hardwareConcurrency ?? 2))
+    : 2;
+
+const workerPool: Worker[] = [];
+let poolIdx = 0;
 let requestId = 0;
-/** Sticky: once the Worker path has failed, stop paying to retry it. */
+
+/**
+ * Sticky fallback: once a worker cannot be constructed or a worker execution
+ * fails, the current page stops attempting worker execution. This avoids
+ * repeatedly paying the structured-clone/worker startup cost after a runtime
+ * incompatibility has already been detected.
+ */
 let workerDisabled = false;
+
+function removeWorker(instance: Worker): void {
+  const index = workerPool.indexOf(instance);
+  if (index >= 0) workerPool.splice(index, 1);
+  try {
+    instance.terminate();
+  } catch {
+    // Best effort only.
+  }
+}
 
 function getWorker(): Worker | null {
   if (workerDisabled) return null;
-  if (worker !== undefined) return worker;
-  try {
-    worker = new Worker(new URL('../workers/pipeline.worker.ts', import.meta.url), {
-      type: 'module'
-    });
-    worker.addEventListener('error', () => {
+
+  if (workerPool.length < MAX_WORKERS) {
+    try {
+      const worker = new Worker(
+        new URL('../workers/pipeline.worker.ts', import.meta.url),
+        { type: 'module' }
+      );
+      workerPool.push(worker);
+      return worker;
+    } catch {
       workerDisabled = true;
-      worker = null;
-    });
-  } catch {
-    worker = null;
-    workerDisabled = true;
+      return null;
+    }
   }
+
+  if (workerPool.length === 0) return null;
+
+  const worker = workerPool[poolIdx % workerPool.length];
+  poolIdx = (poolIdx + 1) % Math.max(1, workerPool.length);
   return worker;
 }
 
@@ -75,7 +103,11 @@ onProgress?: PipelineParams['onProgress'])
     };
     const handleError = (event: ErrorEvent) => {
       cleanup();
-      reject(new Error(event.message || 'A pipeline worker váratlanul leállt.'));
+      reject(
+        new Error(
+          event.message || 'A pipeline worker váratlanul leállt.'
+        )
+      );
     };
     const cleanup = () => {
       instance.removeEventListener('message', handleMessage as EventListener);
@@ -84,7 +116,17 @@ onProgress?: PipelineParams['onProgress'])
     instance.addEventListener('message', handleMessage as EventListener);
     instance.addEventListener('error', handleError as EventListener);
     const request: WorkerRequest = { id, params };
-    instance.postMessage(request);
+
+    try {
+      instance.postMessage(request);
+    } catch (error) {
+      cleanup();
+      reject(
+        error instanceof Error
+          ? error
+          : new Error('A pipeline workernek küldött kérés sikertelen.')
+      );
+    }
   });
 }
 
@@ -130,8 +172,10 @@ export async function runLeaguePipeline(params: PipelineParams): Promise<RunOutc
       };
     } catch {
       // Fall through to the in-process walk; identical math, same output.
+      // The failed worker is removed so a broken worker cannot be selected
+      // again by a later round-robin dispatch.
       workerDisabled = true;
-      worker = null;
+      removeWorker(instance);
     }
   }
 
@@ -141,4 +185,23 @@ export async function runLeaguePipeline(params: PipelineParams): Promise<RunOutc
     seasons: mergeSeasons(params.seasons, result.seasons),
     mode: 'inline'
   };
+}
+
+/**
+ * Releases all pipeline workers owned by this module.
+ *
+ * Normally the pool may live for the lifetime of the page because worker
+ * startup is expensive. This helper is useful for hot-reload/test teardown
+ * and for applications that explicitly unmount the pipeline subsystem.
+ */
+export function disposePipelineWorkers(): void {
+  for (const worker of workerPool.splice(0)) {
+    try {
+      worker.terminate();
+    } catch {
+      // Best effort.
+    }
+  }
+  poolIdx = 0;
+  workerDisabled = false;
 }

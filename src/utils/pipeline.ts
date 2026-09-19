@@ -47,11 +47,12 @@ import {
   FORECAST_MODEL,
   classIndexOf,
   forecastCore,
-  leagueGoalsPerMatch,
   m1SampleOf,
   toMatchPipeline,
   type ForecastHistoryEntry,
-  type ForecastResult } from
+  type ForecastHistoryIndex,
+  type ForecastResult,
+  type LeagueGoalsPerMatch } from
 './forecastCore';
 import { fitEnsembleWeight, fitMultinomialLogistic } from './logistic';
 import { MarketCalibrationAccumulator } from './marketEval';
@@ -116,7 +117,11 @@ export type ScoredMatch = MatchRow & {pipeline: MatchPipeline;};
 
 /** Narrow a match list to the matches that carry a forecast. */
 export function scoredMatchesOf(matches: readonly MatchRow[]): ScoredMatch[] {
-  return matches.filter((m): m is ScoredMatch => Boolean(m.pipeline));
+  return matches.filter(
+    (match): match is ScoredMatch =>
+      match.pipeline !== null &&
+      typeof match.pipeline === 'object'
+  );
 }
 
 /** Cooperative yield, so a long walk never blocks the main thread. */
@@ -155,9 +160,23 @@ function identityOf(match: MatchRow): string {
 }
 
 function prefixSignatureOf(rows: readonly MatchRow[], count: number): string {
-  let acc = '';
-  for (let i = 0; i < count && i < rows.length; i++) acc += identityOf(rows[i]) + ';';
-  return simpleHash(`${count}#${acc}`);
+  const n = Math.min(Math.max(0, count), rows.length);
+  let h = 2166136261 >>> 0;
+
+  const feed = (value: string): void => {
+    for (let i = 0; i < value.length; i++) {
+      h ^= value.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+  };
+
+  feed(`${n}#`);
+  for (let i = 0; i < n; i++) {
+    feed(identityOf(rows[i]));
+    feed(';');
+  }
+
+  return (h >>> 0).toString(16).padStart(8, '0');
 }
 
 function weightsSignatureOf(weights: Record<string, number>): string {
@@ -366,6 +385,119 @@ function scoreBranch(label: string, observations: readonly BranchObservation[]):
 }
 
 /* -------------------------------------------------------------------------- *
+ * High-performance as-of history index
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Mutable index used ONLY for the already-settled prefix.
+ *
+ * Security/correctness invariant:
+ * - the current fixture is never appended before forecastCore() returns;
+ * - therefore every indexed lookup is strictly historical;
+ * - no dynamic code execution, network access, or untrusted query execution
+ *   is introduced by the optimization.
+ *
+ * This avoids repeatedly scanning the complete `entries` array for:
+ * - team history,
+ * - home/away venue history,
+ * - head-to-head history,
+ * - played counts,
+ * - previous-match lookups.
+ */
+class MutableForecastHistoryIndex implements ForecastHistoryIndex {
+  readonly entries: ForecastHistoryEntry[] = [];
+  readonly byTeam = new Map<string, ForecastHistoryEntry[]>();
+  readonly homeByTeam = new Map<string, ForecastHistoryEntry[]>();
+  readonly awayByTeam = new Map<string, ForecastHistoryEntry[]>();
+  readonly h2hByPair = new Map<string, ForecastHistoryEntry[]>();
+  readonly positionOf = new Map<ForecastHistoryEntry, number>();
+
+  clear(): void {
+    this.entries.length = 0;
+    this.byTeam.clear();
+    this.homeByTeam.clear();
+    this.awayByTeam.clear();
+    this.h2hByPair.clear();
+    this.positionOf.clear();
+  }
+
+  append(entry: ForecastHistoryEntry): void {
+    const position = this.entries.length;
+    this.entries.push(entry);
+    this.positionOf.set(entry, position);
+
+    this.push(this.byTeam, entry.homeKey, entry);
+    this.push(this.byTeam, entry.awayKey, entry);
+    this.push(this.homeByTeam, entry.homeKey, entry);
+    this.push(this.awayByTeam, entry.awayKey, entry);
+    this.push(
+      this.h2hByPair,
+      MutableForecastHistoryIndex.pairKey(entry.homeKey, entry.awayKey),
+      entry,
+    );
+  }
+
+  private push(
+    map: Map<string, ForecastHistoryEntry[]>,
+    key: string,
+    entry: ForecastHistoryEntry,
+  ): void {
+    const list = map.get(key);
+    if (list) list.push(entry);
+    else map.set(key, [entry]);
+  }
+
+  private static pairKey(homeKey: string, awayKey: string): string {
+    return homeKey < awayKey
+      ? `${homeKey}\u0000${awayKey}`
+      : `${awayKey}\u0000${homeKey}`;
+  }
+}
+
+interface HistoryGoalsAccumulator {
+  home: number;
+  away: number;
+  count: number;
+}
+
+function emptyHistoryGoals(): HistoryGoalsAccumulator {
+  return { home: 0, away: 0, count: 0 };
+}
+
+function addSettledGoals(
+  totals: HistoryGoalsAccumulator,
+  match: MatchRow,
+): void {
+  const home = Number(match.home_score);
+  const away = Number(match.away_score);
+
+  // MatchRow scores are expected to be numeric. Keep the hot path safe if a
+  // malformed imported row reaches the pipeline: do not poison every later
+  // league average with NaN.
+  if (!Number.isFinite(home) || !Number.isFinite(away)) return;
+
+  totals.home += home;
+  totals.away += away;
+  totals.count += 1;
+}
+
+function gpmFromTotals(
+  totals: HistoryGoalsAccumulator,
+): LeagueGoalsPerMatch {
+  if (totals.count === 0) {
+    return {
+      home: FORECAST_MODEL.fallback.leagueHomeGpm,
+      away: FORECAST_MODEL.fallback.leagueAwayGpm,
+    };
+  }
+
+  return {
+    home: totals.home / totals.count,
+    away: totals.away / totals.count,
+  };
+}
+
+/* -------------------------------------------------------------------------- *
  * The walk
  * -------------------------------------------------------------------------- */
 
@@ -392,6 +524,61 @@ export async function computeLeaguePipeline(params: PipelineParams): Promise<Pip
   });
 
   const total = flat.length;
+
+  if (total === 0) {
+    const emptyState = coldState();
+    const checkpoint: PipelineCheckpoint = {
+      league,
+      featureSchemaVersion: FEATURE_SCHEMA_VERSION,
+      pipelineContractVersion: PIPELINE_CONTRACT_VERSION,
+      processedMatchCount: 0,
+      prefixSignature: prefixSignatureOf(rows, 0),
+      weightsSignature: weightsSignatureOf(weights),
+      experimentsKey: experimentsKeyOf(experiments),
+      historyScope,
+      T: emptyState.T,
+      m1Fit: emptyState.m1Fit,
+      ensembleWM1: emptyState.ensembleWM1,
+      ensembleTuned: emptyState.ensembleTuned,
+      dixonColesRho: null,
+      calibHistory: [],
+      fitHistory: [],
+      m1Samples: [],
+      calibSample: [],
+      ensSamples: [],
+      marketTallies: emptyState.markets.state(),
+      savedAt: new Date().toISOString()
+    };
+
+    return {
+      seasons,
+      calibration: {
+        T: emptyState.T,
+        history: [],
+        ece: null,
+        lastComputedAt: new Date().toISOString(),
+        skillCI: null,
+        entropyFloor: null,
+        modelFit: {
+          m1Source: 'manual',
+          m1SampleSize: 0,
+          m1AvgLogLoss: null,
+          ensembleWM1: emptyState.ensembleWM1,
+          ensembleTuned: false,
+          history: [],
+          m1Fit: null,
+          dixonColesRho: null
+        },
+        experiments: null,
+        markets: emptyState.markets.report()
+      },
+      checkpoint,
+      reusedMatches: 0,
+      kind: 'full',
+      rebuildReason: 'nincs feldolgozható mérkőzés'
+    };
+  }
+
   const weightsSignature = weightsSignatureOf(weights);
   const experimentsKey = experimentsKeyOf(experiments);
   const reuse = reusableCount(params, rows, weightsSignature, experimentsKey);
@@ -401,9 +588,14 @@ export async function computeLeaguePipeline(params: PipelineParams): Promise<Pip
   stateFromCheckpoint(params.checkpoint) :
   coldState();
 
-  /* History slices. `season-only` restarts the slice at every season boundary;
-   * `league-cumulative` carries the whole league forward. */
-  let entries: ForecastHistoryEntry[] = [];
+  /* History is maintained as an append-only AS-OF index.
+   *
+   * `historyIndex.entries` is the canonical chronological prefix passed to
+   * forecastCore(). The current match is appended only AFTER its forecast and
+   * all post-forecast observations have been produced.
+   */
+  const historyIndex = new MutableForecastHistoryIndex();
+  const historyGoals = emptyHistoryGoals();
   let currentSeasonIdx = flat[0]?.seasonIdx ?? 0;
 
   const dcSamples: DcSample[] = [];
@@ -420,18 +612,22 @@ export async function computeLeaguePipeline(params: PipelineParams): Promise<Pip
     const match = season.matches[item.matchIdx];
 
     if (historyScope === 'season-only' && item.seasonIdx !== currentSeasonIdx) {
-      entries = [];
+      historyIndex.clear();
+      historyGoals.home = 0;
+      historyGoals.away = 0;
+      historyGoals.count = 0;
       currentSeasonIdx = item.seasonIdx;
     }
 
     if (i >= reuseCount) {
       const forecast: ForecastResult = forecastCore({
-        entries,
+        entries: historyIndex.entries,
+        historyIndex,
         homeKey: item.homeKey,
         awayKey: item.awayKey,
         weights,
         T: state.T,
-        leagueGpm: leagueGoalsPerMatch(entries),
+        leagueGpm: gpmFromTotals(historyGoals),
         m1Fit: state.m1Fit,
         ensembleWM1: state.ensembleWM1,
         dixonColesRho: null
@@ -481,7 +677,18 @@ export async function computeLeaguePipeline(params: PipelineParams): Promise<Pip
       }
     }
 
-    entries.push({ homeKey: item.homeKey, awayKey: item.awayKey, match });
+    /*
+     * Append ONLY after forecast + observations. This is the critical
+     * prequential barrier: the current result cannot leak into its own
+     * features, probabilities, or refit inputs.
+     */
+    const settledEntry: ForecastHistoryEntry = {
+      homeKey: item.homeKey,
+      awayKey: item.awayKey,
+      match,
+    };
+    historyIndex.append(settledEntry);
+    addSettledGoals(historyGoals, match);
   }
 
   onProgress?.(total, total);
@@ -602,3 +809,10 @@ league: League)
   if (sample.length < 50) return null;
   return fitTemperature(sample);
 }
+
+/**
+ * Design note:
+ * This module intentionally remains a single public pipeline unit. The
+ * computational helpers it imports are kept separate because they are shared
+ * statistical primitives, not because this orchestration file should be split.
+ */

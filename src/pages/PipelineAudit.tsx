@@ -1,5 +1,5 @@
 import React, { useMemo } from 'react';
-import { Activity, BarChart3, Gauge, History, Ruler, Sigma, Thermometer } from 'lucide-react';
+import { Activity, BarChart3, Beaker, Gauge, History, Ruler, Sigma, Thermometer } from 'lucide-react';
 import { useWinmix } from '../contexts/WinmixContext';
 import { useLeagueForecastStats } from '../hooks/useLeagueForecastStats';
 import { LEAGUE_LABEL } from '../data/leagues';
@@ -16,6 +16,7 @@ import { CoreEvidenceSuitePanel } from '../components/winmix/CoreEvidenceSuitePa
 import { CoreTierSuitePanel } from '../components/winmix/CoreTierSuitePanel';
 import { CoreCanonicalSuitePanel } from '../components/winmix/CoreCanonicalSuitePanel';
 import { MarqueeSuitePanel } from '../components/winmix/MarqueeSuitePanel';
+import { GeneratorStructurePanel } from '../components/winmix/GeneratorStructurePanel';
 
 import { MarketCalibrationPanel } from '../components/winmix/MarketCalibrationPanel';
 import { EmptyRow, Table, TableScroll, Td, Th, Tr } from '../components/winmix/DataTable';
@@ -170,6 +171,12 @@ export function PipelineAudit() {
       {/* RANGADÓ — a rangsor-levonás szerződése: nincs levonás evidencia
            nélkül, kis mintán soha, kizárás sosem, más piac bitre azonos. */}
       <MarqueeSuitePanel />
+
+      {/* --- Generator Structure Suite --------------------------------------- */}
+      <SectionHeading icon={Beaker} hint="5 hipotézis · csak olvasható · BH-korrigált">
+        Generátor-szerkezeti tesztszvit
+      </SectionHeading>
+      <GeneratorStructurePanel seasons={seasons} league={currentLeague} />
 
 
       {/* --- Windows ------------------------------------------------------- */}

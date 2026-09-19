@@ -165,6 +165,9 @@ export function PipelineOperationsDashboard() {
             ingestToCloud={() => void ops.ingestToCloud()}
             ingesting={ops.ingesting}
             ingestResult={ops.ingestResult}
+            downloadFromCloud={() => void ops.downloadFromCloud(currentLeague)}
+            downloading={ops.downloading}
+            downloadResult={ops.downloadResult}
           />
         </div> :
       null}

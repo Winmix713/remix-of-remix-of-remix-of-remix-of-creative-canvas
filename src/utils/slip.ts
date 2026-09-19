@@ -1889,9 +1889,7 @@ function lineOf(slot: SlipSlot, pattern: PatternHit): SlipLine {
     coreEvidence: pattern.coreEvidence ?? null,
     evidenceLevel: evidenceLevelOf(pattern),
     coreTier: slot.coreTier ?? null,
-    coreSelectionRuleVersion: CORE_SELECTION_RULE_VERSION,
-    candidateState:
-    ROLE_SPEC[slot.role].kind === 'core' ? 'CORE_PUBLISHED' : null
+    coreSelectionRuleVersion: CORE_SELECTION_RULE_VERSION
   };
 }
 
@@ -1910,11 +1908,6 @@ strategy: CoreStrategySettings)
   filter((slot) => slot.pattern && evidenceLevelOf(slot.pattern as PatternHit) !== 'excluded').
   map((slot) => lineOf(slot, slot.pattern as PatternHit));
 
-  const coreLineCount = lines.filter(
-    (line) => ROLE_SPEC[activeRoleOf(line.role)].kind === 'core'
-  ).length;
-
-
   return {
     id: `slip-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     createdAt: new Date().toISOString(),
@@ -1925,8 +1918,6 @@ strategy: CoreStrategySettings)
     vetoMode: strategy.vetoMode,
     ruleVersion: CORE_SELECTION_RULE_VERSION,
     executionPath: draft.trace?.executionPath,
-    specNullReason: draft.trace?.specNullReason ?? null,
-    coreLineCount,
-    zeroCore: coreLineCount === 0
+    specNullReason: draft.trace?.specNullReason ?? null
   };
 }

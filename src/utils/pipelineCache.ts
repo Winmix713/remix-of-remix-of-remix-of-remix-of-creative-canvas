@@ -41,32 +41,126 @@ export interface CachedPipelineState {
 
 let dbPromise: Promise<IDBDatabase | null> | null = null;
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isCachedPipelineState(value: unknown): value is CachedPipelineState {
+  if (!isRecord(value)) return false;
+
+  return (
+    typeof value.schemaVersion === 'number' &&
+    typeof value.featureSchemaVersion === 'number' &&
+    typeof value.pipelineContractVersion === 'number' &&
+    typeof value.savedAt === 'string' &&
+    Array.isArray(value.seasons) &&
+    isRecord(value.teamWeights) &&
+    isRecord(value.teamAliasMap) &&
+    isRecord(value.seasonCounters) &&
+    isRecord(value.calibration) &&
+    isRecord(value.settings) &&
+    isRecord(value.round) &&
+    Array.isArray(value.slips)
+  );
+}
+
+async function deleteCachedRecord(db: IDBDatabase): Promise<void> {
+  try {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).delete(RECORD_KEY);
+    await new Promise<void>((resolve) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
+    });
+  } catch {
+    // Best effort only.
+  }
+}
+
 function openDB(): Promise<IDBDatabase | null> {
   if (dbPromise) return dbPromise;
+
   dbPromise = new Promise((resolve) => {
     if (typeof indexedDB === 'undefined') {
       resolve(null);
       return;
     }
-    let db: IDBDatabase | null = null;
+
     try {
-      const req = indexedDB.open(DB_NAME, DB_VERSION);
-      req.onupgradeneeded = () => {
-        db = req.result;
+      const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+      request.onupgradeneeded = () => {
+        const db = request.result;
         if (!db.objectStoreNames.contains(STORE_NAME)) {
           db.createObjectStore(STORE_NAME);
         }
       };
-      req.onsuccess = () => {
-        db = req.result;
+
+      request.onsuccess = () => {
+        const db = request.result;
+
+        db.onversionchange = () => {
+          db.close();
+          dbPromise = null;
+        };
+
         resolve(db);
       };
-      req.onerror = () => resolve(null);
+
+      request.onerror = () => {
+        dbPromise = null;
+        resolve(null);
+      };
+
+      request.onblocked = () => {
+        // Another tab is holding an old connection. The cache is optional,
+        // so do not make application startup depend on IndexedDB progress.
+      };
     } catch {
+      dbPromise = null;
       resolve(null);
     }
   });
+
   return dbPromise;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isCachedPipelineState(value: unknown): value is CachedPipelineState {
+  if (!isRecord(value)) return false;
+
+  return (
+    typeof value.schemaVersion === 'number' &&
+    typeof value.featureSchemaVersion === 'number' &&
+    typeof value.pipelineContractVersion === 'number' &&
+    typeof value.savedAt === 'string' &&
+    Array.isArray(value.seasons) &&
+    isRecord(value.teamWeights) &&
+    isRecord(value.teamAliasMap) &&
+    isRecord(value.seasonCounters) &&
+    isRecord(value.calibration) &&
+    isRecord(value.settings) &&
+    isRecord(value.round) &&
+    Array.isArray(value.slips)
+  );
+}
+
+async function deleteCachedRecord(db: IDBDatabase): Promise<void> {
+  try {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).delete(RECORD_KEY);
+    await new Promise<void>((resolve) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
+    });
+  } catch {
+    // Best effort only.
+  }
 }
 
 export function isPipelineCacheAvailable(): Promise<boolean> {
@@ -95,17 +189,23 @@ export async function loadPipelineCache(): Promise<CachedPipelineState | null> {
     const tx = db.transaction(STORE_NAME, 'readonly');
     const req = tx.objectStore(STORE_NAME).get(RECORD_KEY);
     const result = await new Promise<CachedPipelineState | null>((resolve) => {
-      req.onsuccess = () => resolve((req.result as CachedPipelineState) ?? null);
+      req.onsuccess = () => resolve(req.result ?? null);
       req.onerror = () => resolve(null);
     });
-    if (!result) return null;
+    if (!isCachedPipelineState(result)) {
+      await deleteCachedRecord(db);
+      return null;
+    }
+
     if (
       result.schemaVersion !== SCHEMA_VERSION ||
       result.featureSchemaVersion !== FEATURE_SCHEMA_VERSION ||
       result.pipelineContractVersion !== PIPELINE_CONTRACT_VERSION
     ) {
+      await deleteCachedRecord(db);
       return null;
     }
+
     return result;
   } catch {
     return null;
@@ -125,4 +225,14 @@ export async function clearPipelineCache(): Promise<void> {
   } catch {
     // best-effort
   }
+}
+
+/**
+ * Returns the cache timestamp without exposing the IndexedDB record itself.
+ * Useful for UI diagnostics where the application wants to tell the user
+ * whether a restored pipeline is recent.
+ */
+export async function getPipelineCacheSavedAt(): Promise<string | null> {
+  const state = await loadPipelineCache();
+  return state?.savedAt ?? null;
 }
