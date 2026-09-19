@@ -3,6 +3,10 @@ import { ListChecks, Play, RotateCcw, Search, Sigma, Target, TrendingUp, X } fro
 import { toast } from 'sonner';
 import { LEAGUES } from '../data/leagues';
 import { useWinmix } from '../contexts/WinmixContext';
+import { useWinmixConductor } from '../hooks/useWinmixConductor';
+import { buildConductorContext } from '../utils/conductorContext';
+import { ConductorBanner } from '../components/winmix/ConductorBanner';
+import type { WeightTuningProposal } from '../types/conductor';
 import { buildTeamPool, fixturesOf, usedTeamKeys } from '../utils/fixtures';
 import {
   combinedProbability,
@@ -64,8 +68,21 @@ export function FixturePredictor() {
     resetRound,
     saveSlip,
     settings,
-    updateSettings
+    updateSettings,
+    slips,
+    calibration,
+    teamWeights,
+    setWeight,
+    saveWeights
   } = useWinmix();
+
+  const conductorPayload = useMemo(
+    () => seasons.length > 0 ? buildConductorContext(seasons, calibration, slips, teamWeights) : null,
+    [seasons, calibration, slips, teamWeights]
+  );
+
+  const { directives, loading: conductorLoading, error: conductorError, refresh: refreshConductor } =
+    useWinmixConductor(conductorPayload);
 
   const markets = settings.slipMarkets ?? defaultSlipMarkets();
   const strategy = settings.coreStrategy ?? defaultCoreStrategy();
@@ -173,6 +190,29 @@ export function FixturePredictor() {
     [updateSettings]
   );
 
+  const handleToggleVeto = useCallback(() => {
+    const current = settings.coreStrategy ?? defaultCoreStrategy();
+    const nextMode = current.vetoMode === 'active' ? 'shadow' : 'active';
+    void updateSettings({
+      coreStrategy: { ...current, vetoMode: nextMode }
+    });
+    toast.success(
+      nextMode === 'active' ? 'Vétó mód bekapcsolva.' : 'Vétó mód kikapcsolva.'
+    );
+  }, [settings.coreStrategy, updateSettings]);
+
+  const handleAcceptProposal = useCallback(
+    (proposal: WeightTuningProposal) => {
+      setWeight(proposal.league, proposal.teamKey, proposal.proposedValue);
+      void saveWeights();
+      toast.success(
+        `Csapatsúly frissítve: ${proposal.teamKey} (${proposal.metric}) ` +
+        `${proposal.currentValue.toFixed(1)} → ${proposal.proposedValue.toFixed(1)}`
+      );
+    },
+    [setWeight, saveWeights]
+  );
+
   const handleSave = useCallback(() => {
     if (!draft) return;
     // H2 — duplikált mérkőzés esetén a kombinált valószínűség érvénytelen (0),
@@ -199,6 +239,18 @@ export function FixturePredictor() {
   return (
     <div className="flex flex-col gap-4 md:gap-5">
       <PageHeader icon={Target} title="Forduló Prediktor — Top 3+3" intro={INTRO} />
+
+      {conductorPayload ? (
+        <ConductorBanner
+          directives={directives}
+          loading={conductorLoading}
+          error={conductorError}
+          currentVetoMode={strategy.vetoMode}
+          onToggleVeto={handleToggleVeto}
+          onAcceptProposal={handleAcceptProposal}
+          onRefresh={() => refreshConductor(true)}
+        />
+      ) : null}
 
       <MetricGrid>
         <MetricCard
