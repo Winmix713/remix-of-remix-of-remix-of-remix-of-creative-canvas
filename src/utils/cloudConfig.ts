@@ -6,24 +6,84 @@
  * key is a server-only secret and must never appear anywhere in client code.
  *
  * Resolution order:
- *  1. Vite environment (`.env` → VITE_SUPABASE_URL + VITE_SUPABASE_PUBLISHABLE_KEY,
+ *  1. Runtime override (localStorage — set from the PIN-gated config editor)
+ *  2. Vite environment (`.env` → VITE_SUPABASE_URL + VITE_SUPABASE_PUBLISHABLE_KEY,
  *     or the historical VITE_SUPABASE_ANON_KEY name)
- *  2. The baked-in fallback below (the Lovable Cloud project of this app), so
+ *  3. The baked-in fallback below (the Lovable Cloud project of this app), so
  *     the tier also works in builds where a `.env` file is not injected.
- *  3. `null` — genuinely unconfigured. Reachable only if BOTH the env and the
- *     fallback fail validation (e.g. someone blanks out the constants below
- *     for a stripped build). See docs/supabase-migration.md §1.3.
+ *  4. `null` — genuinely unconfigured. Reachable only if ALL of the above fail
+ *     validation. See docs/supabase-migration.md §1.3.
  */
 
 const FALLBACK_URL = 'https://oaadhaapbgzyibyadgdh.supabase.co';
 /** Publishable key (Lovable Cloud project oaadhaapbgzyibyadgdh) — browser-safe behind RLS. */
 const FALLBACK_ANON_KEY = 'sb_publishable_juS6O5xPz0l61tz7c4nAyw_9cFO5bnx';
 
+const OVERRIDE_STORAGE_KEY = 'winmix_cloud_override';
+const GEMINI_OVERRIDE_KEY = 'winmix_gemini_key';
+
 export interface CloudEnv {
   url: string;
   anonKey: string;
   /** Where the credentials came from — surfaced in diagnostics. */
-  source: 'env' | 'fallback';
+  source: 'override' | 'env' | 'fallback';
+}
+
+export interface CloudOverride {
+  supabaseUrl: string;
+  supabaseKey: string;
+}
+
+/** Read the runtime override from localStorage, if any. */
+export function readCloudOverride(): CloudOverride | null {
+  try {
+    const raw = localStorage.getItem(OVERRIDE_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<CloudOverride>;
+    const url = (parsed.supabaseUrl ?? '').trim();
+    const key = (parsed.supabaseKey ?? '').trim();
+    if (url && key) return { supabaseUrl: url, supabaseKey: key };
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Persist a runtime override. Pass null to clear. */
+export function writeCloudOverride(override: CloudOverride | null): void {
+  try {
+    if (override) {
+      localStorage.setItem(OVERRIDE_STORAGE_KEY, JSON.stringify(override));
+    } else {
+      localStorage.removeItem(OVERRIDE_STORAGE_KEY);
+    }
+    cachedEnv = undefined;
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Read the runtime Gemini API key override from localStorage, if any. */
+export function readGeminiKeyOverride(): string | null {
+  try {
+    const raw = localStorage.getItem(GEMINI_OVERRIDE_KEY);
+    return raw && raw.trim() ? raw.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Persist a Gemini API key override. Pass null to clear. */
+export function writeGeminiKeyOverride(key: string | null): void {
+  try {
+    if (key) {
+      localStorage.setItem(GEMINI_OVERRIDE_KEY, key);
+    } else {
+      localStorage.removeItem(GEMINI_OVERRIDE_KEY);
+    }
+  } catch {
+    /* ignore */
+  }
 }
 
 function fromEnv(key: string): string {
@@ -66,6 +126,14 @@ export function resolveCloudEnv(
     (env['VITE_SUPABASE_PUBLISHABLE_KEY'] ?? '').trim() ||
     (env['VITE_SUPABASE_ANON_KEY'] ?? '').trim();
 
+  const override = readCloudOverride();
+  if (override && isValidHttpUrl(override.supabaseUrl) && isNonEmptyKey(override.supabaseKey)) {
+    return Object.freeze({
+      url: override.supabaseUrl.replace(/\/+$/, ''),
+      anonKey: override.supabaseKey,
+      source: 'override' as const
+    });
+  }
 
   if (isValidHttpUrl(envUrl) && isNonEmptyKey(envKey)) {
     return Object.freeze({

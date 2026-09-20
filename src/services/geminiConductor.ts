@@ -1,6 +1,7 @@
 import type { ConductorDirectives } from '../types/conductor';
 import { defaultDirectives } from '../types/conductor';
 import { payloadToPromptText, type ConductorPayload } from '../utils/conductorContext';
+import { readGeminiKeyOverride } from '../utils/cloudConfig';
 
 // Prioritási sorrend: ha az elsődleges 503-at dob, azonnal átvált a tartalék modellekre
 const FALLBACK_MODELS = [
@@ -90,9 +91,9 @@ export interface ConductorResult {
 export async function fetchConductorDirectives(
   payload: ConductorPayload
 ): Promise<ConductorResult> {
-  const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
+  const apiKey = readGeminiKeyOverride() ?? import.meta.env.VITE_GEMINI_API_KEY;
   if (!apiKey) {
-    return { directives: null, error: 'Nincs beállítva API kulcs (VITE_GEMINI_API_KEY).' };
+    return { directives: null, error: 'Nincs beállítva API kulcs (VITE_GEMINI_API_KEY vagy webes felülírás).' };
   }
 
   const promptText = payloadToPromptText(payload);

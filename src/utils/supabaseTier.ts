@@ -38,7 +38,7 @@ function describeHttpError(status: number, statusText: string): string {
 }
 
 /** Non-secret connection summary for the diagnostics panel. */
-export function cloudEndpointSummary(): {url: string;source: 'env' | 'fallback';} | null {
+export function cloudEndpointSummary(): {url: string;source: 'override' | 'env' | 'fallback';} | null {
   const env = readEnv();
   return env ? { url: env.url, source: env.source } : null;
 }

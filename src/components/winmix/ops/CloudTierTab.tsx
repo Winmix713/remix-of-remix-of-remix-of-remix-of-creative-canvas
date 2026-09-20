@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import { useMemo } from 'react';
 import { Cloud, CloudOff, Download, RefreshCw, Upload } from 'lucide-react';
 import { useCloudTierContext } from '../../../contexts/CloudTierContext';
 import { cloudEndpointSummary } from '../../../utils/supabaseTier';
@@ -6,6 +6,7 @@ import { CROSSCHECK_TOLERANCE, type CrossCheckRow } from '../../../hooks/useOpsA
 import type { League } from '../../../types/winmix';
 import { DataGrid, type GridColumn } from '../DataGrid';
 import { Chip, Panel, PanelActions, PanelHeader, PanelSubtitle, PanelTitle } from '../Panel';
+import { CloudConfigEditor } from './CloudConfigEditor';
 
 export function CloudTierTab({
   league,
@@ -27,7 +28,7 @@ export function CloudTierTab({
   downloadResult: { seasons: number; matches: number; failures: string[] } | null;
 }) {
   const cloud = useCloudTierContext();
-  const endpoint = useMemo(() => cloudEndpointSummary(), []);
+  const endpoint = useMemo(() => cloudEndpointSummary(), [cloud.health.checkedAt]);
 
   const columns = useMemo<GridColumn<CrossCheckRow>[]>(
     () => [
@@ -75,6 +76,9 @@ export function CloudTierTab({
   );
 
   return (
+    <div className="flex flex-col gap-3 md:gap-4">
+      <CloudConfigEditor onSaved={() => void cloud.retry()} />
+
     <Panel>
       <PanelHeader>
         <div className="flex min-w-0 flex-col gap-0.5">
@@ -152,7 +156,7 @@ export function CloudTierTab({
       <p className="break-words border-b border-border px-3 py-2 text-ui-xs text-muted-foreground sm:px-4">
           Végpont: <code className="font-mono text-foreground">{endpoint.url}/rest/v1</code> · kulcs
           forrása:{' '}
-          <code className="font-mono">{endpoint.source === 'env' ? '.env' : 'beépített publishable'}</code>
+          <code className="font-mono">{endpoint.source === 'override' ? 'webes felülírás' : endpoint.source === 'env' ? '.env' : 'beépített publishable'}</code>
         </p> :
       null}
 
@@ -195,6 +199,8 @@ export function CloudTierTab({
           </>
         } />
       
-    </Panel>);
+    </Panel>
+    </div>
+  );
 
 }
