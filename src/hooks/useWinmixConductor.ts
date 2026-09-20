@@ -6,58 +6,42 @@ import {
 } from 'react';
 
 import type { ConductorDirectives } from '../types/conductor';
-import { defaultDirectives } from '../types/conductor';
+import * as ConductorTypes from '../types/conductor';
 
 import { fetchConductorDirectives } from '../services/geminiConductor';
-
 import type { ConductorPayload } from '../utils/conductorContext';
 
 /* -------------------------------------------------------------------------- */
-/* CONFIG                                                                     */
+/* HELPER: RESOLVE DEFAULT DIRECTIVES (Handles object OR factory function)     */
+/* -------------------------------------------------------------------------- */
+function getDefaultDirectives(): ConductorDirectives {
+  const d = (ConductorTypes as Record<string, unknown>).defaultDirectives;
+  if (typeof d === 'function') {
+    return (d as () => ConductorDirectives)();
+  }
+  return d as ConductorDirectives;
+}
+
+/* -------------------------------------------------------------------------- */
+/* CONFIG & TELEMETRY                                                         */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Session-level cache.
- *
- * The previous implementation stored only ONE payload.
- * If payload A -> payload B -> payload A happened, A was no longer cached.
- *
- * We now keep several payloads independently.
- */
 const CACHE_KEY = 'winmix-conductor-cache-v2';
-
-const CACHE_TTL_MS =
-  30 * 60 * 1000; // 30 minutes
-
+const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_CACHE_ENTRIES = 8;
 
-/**
- * Minimum time between manual/automatic hook-level refreshes.
- *
- * The service layer has an additional global rate limiter.
- * This second layer prevents React from repeatedly calling the service.
- */
-const MIN_REFRESH_INTERVAL_MS =
-  15_000;
+const MIN_REFRESH_INTERVAL_MS = 15_000;
+const FORCE_REFRESH_COOLDOWN_MS = 30_000;
+const MAX_PENDING_REFETCH_DELAY_MS = 500;
 
-/**
- * Force refresh has a separate, longer protection.
- *
- * A button repeatedly clicked by the user must not bypass
- * the rate-limit protection.
- */
-const FORCE_REFRESH_COOLDOWN_MS =
-  30_000;
+let requestSequence = 0;
 
-/**
- * If the payload changes while another request is active,
- * we do not immediately start another Gemini request.
- *
- * The new payload is remembered and evaluated after the active request
- * finishes.
- */
-const MAX_PENDING_REFETCH_DELAY_MS =
-  500;
+function logConductor(event: string, meta?: Record<string, unknown>) {
+  const metaStr = meta
+    ? ' | ' + Object.entries(meta).map(([k, v]) => `${k}=${v}`).join(' ')
+    : '';
+  console.log(`[Conductor] ${event}${metaStr}`);
+}
 
 /* -------------------------------------------------------------------------- */
 /* TYPES                                                                      */
@@ -85,67 +69,36 @@ export interface UseConductorResult {
 /* PAYLOAD HASH                                                               */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Creates a deterministic lightweight payload fingerprint.
- *
- * Important:
- * This intentionally contains the information that affects the Conductor
- * decision rather than object identity.
- *
- * Therefore:
- *
- * new object !== old object
- *
- * does NOT automatically mean:
- *
- * new Conductor request required.
- */
-function hashPayload(
-  payload: ConductorPayload,
-): string {
+function hashPayload(payload: ConductorPayload): string {
   const parts = [
     `seasons:${payload.seasonCount}`,
-
     `leagues:${payload.leagues
-      .map(
-        (league) =>
-          [
-            league.league,
-            league.sampleSize,
-            Number.isFinite(
-              league.observedBttsRate,
-            )
-              ? league.observedBttsRate.toFixed(
-                  4,
-                )
-              : 'nan',
-          ].join(':'),
+      .map((league) =>
+        [
+          league.league,
+          league.sampleSize,
+          Number.isFinite(league.observedBttsRate)
+            ? league.observedBttsRate.toFixed(4)
+            : 'nan',
+        ].join(':'),
       )
       .sort()
       .join(',')}`,
-
     `round:${[
       payload.round.totalMatches,
       payload.round.bttsAbove50,
       payload.round.blowoutRiskCount,
     ].join(':')}`,
-
     `weights:${payload.weightOutliers
-      .map(
-        (outlier) =>
-          [
-            outlier.league,
-            outlier.teamKey,
-            Number.isFinite(
-              outlier.weight,
-            )
-              ? outlier.weight.toFixed(3)
-              : 'nan',
-          ].join(':'),
+      .map((outlier) =>
+        [
+          outlier.league,
+          outlier.teamKey,
+          Number.isFinite(outlier.weight) ? outlier.weight.toFixed(3) : 'nan',
+        ].join(':'),
       )
       .sort()
       .join(',')}`,
-
     `ledger:${[
       payload.ledger.totalSlips,
       payload.ledger.settledSlips,
@@ -162,674 +115,277 @@ function hashPayload(
 
 function readCache(): CacheStore {
   try {
-    const raw =
-      sessionStorage.getItem(
-        CACHE_KEY,
-      );
+    const raw = sessionStorage.getItem(CACHE_KEY);
+    if (!raw) return { version: 2, entries: [] };
 
-    if (!raw) {
-      return {
-        version: 2,
-        entries: [],
-      };
-    }
-
-    const parsed =
-      JSON.parse(raw) as Partial<CacheStore>;
-
-    if (
-      parsed.version !== 2 ||
-      !Array.isArray(parsed.entries)
-    ) {
-      return {
-        version: 2,
-        entries: [],
-      };
+    const parsed = JSON.parse(raw) as Partial<CacheStore>;
+    if (parsed.version !== 2 || !Array.isArray(parsed.entries)) {
+      return { version: 2, entries: [] };
     }
 
     const now = Date.now();
-
-    const validEntries =
-      parsed.entries.filter(
-        (entry): entry is CacheEntry =>
-          Boolean(
-            entry &&
-              typeof entry.payloadHash ===
-                'string' &&
-              entry.directives &&
-              typeof entry.directives ===
-                'object' &&
-              typeof entry.cachedAt ===
-                'number' &&
-              now - entry.cachedAt <=
-                CACHE_TTL_MS,
-          ),
-      );
+    const validEntries = parsed.entries.filter(
+      (entry): entry is CacheEntry =>
+        Boolean(
+          entry &&
+            typeof entry.payloadHash === 'string' &&
+            entry.directives &&
+            typeof entry.directives === 'object' &&
+            typeof entry.cachedAt === 'number' &&
+            now - entry.cachedAt <= CACHE_TTL_MS,
+        ),
+    );
 
     return {
       version: 2,
-      entries: validEntries.slice(
-        0,
-        MAX_CACHE_ENTRIES,
-      ),
+      entries: validEntries.slice(0, MAX_CACHE_ENTRIES),
     };
   } catch {
-    return {
-      version: 2,
-      entries: [],
-    };
+    return { version: 2, entries: [] };
   }
 }
 
-function writeCache(
-  entry: CacheEntry,
-): void {
+function writeCache(entry: CacheEntry): void {
   try {
-    const store =
-      readCache();
-
-    const existingIndex =
-      store.entries.findIndex(
-        (item) =>
-          item.payloadHash ===
-          entry.payloadHash,
-      );
+    const store = readCache();
+    const existingIndex = store.entries.findIndex(
+      (item) => item.payloadHash === entry.payloadHash,
+    );
 
     if (existingIndex !== -1) {
-      store.entries.splice(
-        existingIndex,
-        1,
-      );
+      store.entries.splice(existingIndex, 1);
     }
 
-    store.entries.unshift(
-      entry,
-    );
+    store.entries.unshift(entry);
+    store.entries = store.entries.slice(0, MAX_CACHE_ENTRIES);
 
-    store.entries =
-      store.entries.slice(
-        0,
-        MAX_CACHE_ENTRIES,
-      );
-
-    sessionStorage.setItem(
-      CACHE_KEY,
-      JSON.stringify(store),
-    );
+    sessionStorage.setItem(CACHE_KEY, JSON.stringify(store));
   } catch {
-    /*
-     * sessionStorage can be unavailable in private browsing,
-     * sandboxed environments or when storage quota is exceeded.
-     *
-     * The Conductor must continue working without it.
-     */
+    // sessionStorage nem elérhető vagy kvóta túllépve
   }
 }
 
-function readCachedDirectives(
-  payloadHash: string,
-): ConductorDirectives | null {
-  const store =
-    readCache();
-
-  const entry =
-    store.entries.find(
-      (item) =>
-        item.payloadHash ===
-        payloadHash,
-    );
-
-  if (!entry) {
-    return null;
-  }
-
-  return entry.directives;
+function readCachedDirectives(payloadHash: string): ConductorDirectives | null {
+  const store = readCache();
+  const entry = store.entries.find((item) => item.payloadHash === payloadHash);
+  return entry ? entry.directives : null;
 }
 
 /* -------------------------------------------------------------------------- */
-/* HASH COMPARISON                                                            */
-/* -------------------------------------------------------------------------- */
-
-/**
- * We keep the last processed hash separately from the payload reference.
- *
- * This is important because parents may create a new payload object on every
- * render even when the actual Conductor input has not changed.
- */
-function usePayloadHash(
-  payload: ConductorPayload | null,
-): string | null {
-  return payload
-    ? hashPayload(payload)
-    : null;
-}
-
-/* -------------------------------------------------------------------------- */
-/* HOOK                                                                       */
+/* HOOK IMPLEMENTATION                                                        */
 /* -------------------------------------------------------------------------- */
 
 export function useWinmixConductor(
   payload: ConductorPayload | null,
 ): UseConductorResult {
-  const [directives, setDirectives] =
-    useState<ConductorDirectives>(
-      defaultDirectives,
-    );
+  const [directives, setDirectives] = useState<ConductorDirectives>(getDefaultDirectives);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const [loading, setLoading] =
-    useState(false);
+  const payloadRef = useRef<ConductorPayload | null>(payload);
+  payloadRef.current = payload;
 
-  const [error, setError] =
-    useState<string | null>(null);
+  const payloadHash = payload ? hashPayload(payload) : null;
+  const payloadHashRef = useRef<string | null>(payloadHash);
+  payloadHashRef.current = payloadHash;
 
-  /**
-   * Always keep the latest payload available to async callbacks.
-   */
-  const payloadRef =
-    useRef<ConductorPayload | null>(
-      payload,
-    );
+  const mountedRef = useRef(true);
+  const processedHashRef = useRef<string | null>(null);
+  const inFlightHashRef = useRef<string | null>(null);
 
-  payloadRef.current =
-    payload;
-
-  /**
-   * Latest deterministic payload hash.
-   */
-  const payloadHash =
-    usePayloadHash(payload);
-
-  const payloadHashRef =
-    useRef<string | null>(
-      payloadHash,
-    );
-
-  payloadHashRef.current =
-    payloadHash;
-
-  /**
-   * Prevent state updates after unmount.
-   */
-  const mountedRef =
-    useRef(true);
-
-  /**
-   * Last payload that has actually been processed.
-   */
-  const processedHashRef =
-    useRef<string | null>(null);
-
-  /**
-   * Hash currently being requested.
-   */
-  const inFlightHashRef =
-    useRef<string | null>(null);
-
-  /**
-   * Manual/automatic request timestamps.
-   */
-  const lastRefreshAtRef =
-    useRef(0);
-
-  const lastForceRefreshAtRef =
-    useRef(0);
-
-  /**
-   * Prevent multiple doFetch() calls from starting simultaneously
-   * inside this hook instance.
-   */
-  const requestPromiseRef =
-    useRef<Promise<void> | null>(
-      null,
-    );
-
-  /**
-   * When a payload changes during a request, remember that another
-   * evaluation is needed afterwards.
-   */
-  const pendingRefetchRef =
-    useRef(false);
-
-  /* ------------------------------------------------------------------------ */
-  /* UNMOUNT                                                                 */
-  /* ------------------------------------------------------------------------ */
+  const lastRefreshAtRef = useRef(0);
+  const lastForceRefreshAtRef = useRef(0);
+  const requestPromiseRef = useRef<Promise<void> | null>(null);
+  const pendingRefetchRef = useRef(false);
 
   useEffect(() => {
-    mountedRef.current =
-      true;
-
+    mountedRef.current = true;
     return () => {
-      mountedRef.current =
-        false;
+      mountedRef.current = false;
     };
   }, []);
 
-  /* ------------------------------------------------------------------------ */
-  /* SAFE STATE HELPERS                                                       */
-  /* ------------------------------------------------------------------------ */
+  const setSafeDirectives = useCallback((val: ConductorDirectives) => {
+    if (mountedRef.current) setDirectives(val);
+  }, []);
 
-  const setSafeDirectives =
-    useCallback(
-      (
-        value: ConductorDirectives,
-      ) => {
-        if (
-          mountedRef.current
-        ) {
-          setDirectives(value);
-        }
-      },
-      [],
-    );
+  const setSafeLoading = useCallback((val: boolean) => {
+    if (mountedRef.current) setLoading(val);
+  }, []);
 
-  const setSafeLoading =
-    useCallback(
-      (value: boolean) => {
-        if (
-          mountedRef.current
-        ) {
-          setLoading(value);
-        }
-      },
-      [],
-    );
-
-  const setSafeError =
-    useCallback(
-      (
-        value: string | null,
-      ) => {
-        if (
-          mountedRef.current
-        ) {
-          setError(value);
-        }
-      },
-      [],
-    );
+  const setSafeError = useCallback((val: string | null) => {
+    if (mountedRef.current) setError(val);
+  }, []);
 
   /* ------------------------------------------------------------------------ */
-  /* FETCH                                                                    */
+  /* FETCH EXECUTOR                                                           */
   /* ------------------------------------------------------------------------ */
 
   const doFetch = useCallback(
-    async (
-      force: boolean,
-    ): Promise<void> => {
-      const currentPayload =
-        payloadRef.current;
+    async (force: boolean, triggerType: 'AUTO' | 'FORCE' | 'PENDING' = 'AUTO'): Promise<void> => {
+      const currentPayload = payloadRef.current;
+      const currentHash = payloadHashRef.current;
 
-      const currentHash =
-        payloadHashRef.current;
-
-      if (
-        !currentPayload ||
-        !currentHash
-      ) {
-        setSafeDirectives(
-          defaultDirectives(),
-        );
+      if (!currentPayload || !currentHash) {
+        setSafeDirectives(getDefaultDirectives());
         setSafeLoading(false);
         setSafeError(null);
-
-        processedHashRef.current =
-          null;
-
+        processedHashRef.current = null;
         return;
       }
 
-      /* ------------------------------------------------------------------ */
-      /* DUPLICATE REQUEST                                                  */
-      /* ------------------------------------------------------------------ */
-
-      if (
-        requestPromiseRef.current
-      ) {
-        /*
-         * There is already a request in progress.
-         *
-         * We do not create another Gemini call.
-         */
-        pendingRefetchRef.current =
-          true;
-
+      // Duplikátum kérés szűrése
+      if (requestPromiseRef.current) {
+        logConductor('IN_FLIGHT_BUSY', { triggerType, currentHash: currentHash.slice(0, 16) });
+        pendingRefetchRef.current = true;
         return;
       }
 
-      /* ------------------------------------------------------------------ */
-      /* SAME PAYLOAD                                                       */
-      /* ------------------------------------------------------------------ */
-
-      if (
-        !force &&
-        processedHashRef.current ===
-          currentHash
-      ) {
+      // Változatlan payload esetén kilépés (kivéve force)
+      if (!force && processedHashRef.current === currentHash) {
         return;
       }
 
-      /* ------------------------------------------------------------------ */
-      /* CACHE                                                               */
-      /* ------------------------------------------------------------------ */
-
+      // Cache olvasás
       if (!force) {
-        const cached =
-          readCachedDirectives(
-            currentHash,
-          );
-
+        const cached = readCachedDirectives(currentHash);
         if (cached) {
-          processedHashRef.current =
-            currentHash;
-
-          setSafeDirectives(
-            cached,
-          );
-
+          logConductor('CACHE_HIT', { hash: currentHash.slice(0, 16) });
+          processedHashRef.current = currentHash;
+          setSafeDirectives(cached);
           setSafeLoading(false);
           setSafeError(null);
-
           return;
         }
       }
 
-      /* ------------------------------------------------------------------ */
-      /* FORCE REFRESH RATE LIMIT                                           */
-      /* ------------------------------------------------------------------ */
+      const now = Date.now();
 
-      const now =
-        Date.now();
-
-      if (
-        force &&
-        now -
-            lastForceRefreshAtRef.current <
-          FORCE_REFRESH_COOLDOWN_MS
-      ) {
-        setSafeError(
-          'A Conductor kézi frissítése átmenetileg korlátozva van. Kérlek, várj néhány másodpercet.',
-        );
-
+      // Force refresh cooldown
+      if (force && now - lastForceRefreshAtRef.current < FORCE_REFRESH_COOLDOWN_MS) {
+        const waitSec = Math.ceil((FORCE_REFRESH_COOLDOWN_MS - (now - lastForceRefreshAtRef.current)) / 1000);
+        logConductor('FORCE_RATE_LIMITED', { waitSec });
+        setSafeError(`A Conductor kézi frissítése átmenetileg korlátozva van. Várj ${waitSec} másodpercet.`);
         return;
       }
 
-      /* ------------------------------------------------------------------ */
-      /* GENERAL REFRESH RATE LIMIT                                         */
-      /* ------------------------------------------------------------------ */
-
-      if (
-        !force &&
-        now -
-            lastRefreshAtRef.current <
-          MIN_REFRESH_INTERVAL_MS
-      ) {
-        /*
-         * Do not show this as a hard error.
-         *
-         * The user should still see the latest valid directives.
-         */
+      // Általános rate limit
+      if (!force && now - lastRefreshAtRef.current < MIN_REFRESH_INTERVAL_MS) {
+        logConductor('AUTO_RATE_LIMITED_DEBOUNCE', { hash: currentHash.slice(0, 16) });
         return;
       }
 
-      /* ------------------------------------------------------------------ */
-      /* START REQUEST                                                      */
-      /* ------------------------------------------------------------------ */
+      const seq = ++requestSequence;
+      lastRefreshAtRef.current = now;
+      if (force) lastForceRefreshAtRef.current = now;
 
-      lastRefreshAtRef.current =
-        now;
+      inFlightHashRef.current = currentHash;
+      pendingRefetchRef.current = false;
 
-      if (force) {
-        lastForceRefreshAtRef.current =
-          now;
-      }
-
-      inFlightHashRef.current =
-        currentHash;
-
-      pendingRefetchRef.current =
-        false;
-
+      logConductor(`#${seq} START_${triggerType}`, { hash: currentHash.slice(0, 16) });
       setSafeLoading(true);
       setSafeError(null);
 
-      const requestPromise =
-        (async () => {
-          try {
-            const result =
-              await fetchConductorDirectives(
-                currentPayload,
-              );
+      const requestPromise = (async () => {
+        try {
+          const result = await fetchConductorDirectives(currentPayload);
 
-            /*
-             * The component may have unmounted while Gemini was processing.
-             */
-            if (
-              !mountedRef.current
-            ) {
-              return;
-            }
+          if (!mountedRef.current) return;
 
-            /*
-             * IMPORTANT:
-             *
-             * If the payload changed while the request was running,
-             * the result belongs to the OLD payload.
-             *
-             * We may display it temporarily, but we must NOT mark the
-             * NEW payload as processed.
-             */
-            const latestHash =
-              payloadHashRef.current;
+          const latestHash = payloadHashRef.current;
+          const isStillCurrent = latestHash === currentHash;
 
-            const requestStillCurrent =
-              latestHash ===
-              currentHash;
+          if (result.directives) {
+            setSafeDirectives(result.directives);
 
-            if (
-              result.directives
-            ) {
-              setSafeDirectives(
-                result.directives,
-              );
-
+            // KRITIKUS JAVÍTÁS: Csak akkor írjuk a cache-be, ha NEM fallback hibaeredmény!
+            if (!result.error) {
               writeCache({
-                payloadHash:
-                  currentHash,
-                directives:
-                  result.directives,
-                cachedAt:
-                  Date.now(),
+                payloadHash: currentHash,
+                directives: result.directives,
+                cachedAt: Date.now(),
               });
-
-              if (
-                requestStillCurrent
-              ) {
-                processedHashRef.current =
-                  currentHash;
+              if (isStillCurrent) {
+                processedHashRef.current = currentHash;
               }
-
-              /*
-               * A service-level fallback can still contain directives while
-               * returning an error. Preserve that distinction.
-               */
-              setSafeError(
-                result.error,
-              );
+              logConductor(`#${seq} SUCCESS_CACHED`, { hash: currentHash.slice(0, 16) });
             } else {
-              /*
-               * Do NOT wipe out the current valid directives merely because
-               * Gemini temporarily failed.
-               *
-               * This is a major behavioral improvement over the old hook.
-               */
-              setSafeError(
-                result.error ??
-                  'Ismeretlen Conductor hiba.',
-              );
-            }
-          } catch (err) {
-            if (
-              !mountedRef.current
-            ) {
-              return;
+              logConductor(`#${seq} DEGRADED_FALLBACK_NOT_CACHED`, { error: result.error });
             }
 
-            const message =
-              err instanceof Error
-                ? err.message
-                : String(err);
-
-            console.warn(
-              '[Conductor] Hiba:',
-              err,
-            );
-
-            /*
-             * Keep the last valid directives.
-             * A monitoring service should degrade gracefully.
-             */
-            setSafeError(
-              `Váratlan Conductor hiba: ${message}`,
-            );
-          } finally {
-            if (
-              inFlightHashRef.current ===
-              currentHash
-            ) {
-              inFlightHashRef.current =
-                null;
-            }
-
-            if (
-              requestPromiseRef.current
-            ) {
-              requestPromiseRef.current =
-                null;
-            }
-
-            setSafeLoading(false);
-
-            /*
-             * If a new payload arrived while the request was running,
-             * schedule exactly ONE follow-up evaluation.
-             */
-            if (
-              pendingRefetchRef.current &&
-              mountedRef.current
-            ) {
-              pendingRefetchRef.current =
-                false;
-
-              window.setTimeout(
-                () => {
-                  if (
-                    !mountedRef.current
-                  ) {
-                    return;
-                  }
-
-                  void doFetch(false);
-                },
-                MAX_PENDING_REFETCH_DELAY_MS,
-              );
-            }
+            setSafeError(result.error);
+          } else {
+            logConductor(`#${seq} FAILED_DIRECTIVES_NULL`, { error: result.error });
+            setSafeError(result.error ?? 'Ismeretlen Conductor hiba.');
           }
-        })();
+        } catch (err) {
+          if (!mountedRef.current) return;
+          const msg = err instanceof Error ? err.message : String(err);
+          logConductor(`#${seq} UNCAUGHT_EXCEPTION`, { error: msg });
+          setSafeError(`Váratlan Conductor hiba: ${msg}`);
+        } finally {
+          if (inFlightHashRef.current === currentHash) {
+            inFlightHashRef.current = null;
+          }
+          requestPromiseRef.current = null;
+          setSafeLoading(false);
 
-      requestPromiseRef.current =
-        requestPromise;
+          if (pendingRefetchRef.current && mountedRef.current) {
+            pendingRefetchRef.current = false;
+            logConductor('PENDING_REFETCH_SCHEDULED');
+            window.setTimeout(() => {
+              if (mountedRef.current) {
+                void doFetch(false, 'PENDING');
+              }
+            }, MAX_PENDING_REFETCH_DELAY_MS);
+          }
+        }
+      })();
 
+      requestPromiseRef.current = requestPromise;
       await requestPromise;
     },
-    [
-      setSafeDirectives,
-      setSafeError,
-      setSafeLoading,
-    ],
+    [setSafeDirectives, setSafeError, setSafeLoading],
   );
 
   /* ------------------------------------------------------------------------ */
   /* PUBLIC REFRESH                                                           */
   /* ------------------------------------------------------------------------ */
 
-  const refresh =
-    useCallback(
-      (force?: boolean) => {
-        void doFetch(
-          force === true,
-        );
-      },
-      [doFetch],
-    );
+  const refresh = useCallback(
+    (force?: boolean) => {
+      void doFetch(force === true, force ? 'FORCE' : 'AUTO');
+    },
+    [doFetch],
+  );
 
   /* ------------------------------------------------------------------------ */
-  /* AUTOMATIC FETCH                                                          */
+  /* AUTOMATIC FETCH (KIZÁRÓLAG payloadHash ALAPJÁN)                          */
   /* ------------------------------------------------------------------------ */
 
   useEffect(() => {
-    if (!payload) {
-      processedHashRef.current =
-        null;
-
-      setSafeDirectives(
-        defaultDirectives(),
-      );
-
+    // 1. Ha nincs hash (nincs adat), alaphelyzetbe állunk
+    if (!payloadHash) {
+      processedHashRef.current = null;
+      setSafeDirectives(getDefaultDirectives());
       setSafeLoading(false);
       setSafeError(null);
-
       return;
     }
 
-    /*
-     * The effect depends on the deterministic hash rather than merely
-     * depending on the payload object.
-     *
-     * This is critical for React applications where payload objects can
-     * be recreated on every render.
-     */
-    if (
-      payloadHash === null
-    ) {
+    // 2. Ha a tartalom ujjlenyomata nem változott, NEM futunk le újra
+    if (processedHashRef.current === payloadHash) {
       return;
     }
 
-    /*
-     * Same logical payload -> nothing to do.
-     */
-    if (
-      processedHashRef.current ===
-      payloadHash
-    ) {
+    // 3. Ha már fut egy kérés, megjelöljük a folyamatot
+    if (requestPromiseRef.current) {
+      pendingRefetchRef.current = true;
       return;
     }
 
-    /*
-     * A request is already running.
-     * Mark the payload as pending; doFetch() will evaluate it afterwards.
-     */
-    if (
-      requestPromiseRef.current
-    ) {
-      pendingRefetchRef.current =
-        true;
-
-      return;
-    }
-
-    void doFetch(false);
-  }, [
-    payloadHash,
-    payload,
-    doFetch,
-    setSafeDirectives,
-    setSafeError,
-    setSafeLoading,
-  ]);
-
-  /* ------------------------------------------------------------------------ */
-  /* RETURN                                                                   */
-  /* ------------------------------------------------------------------------ */
+    void doFetch(false, 'AUTO');
+  }, [payloadHash, doFetch, setSafeDirectives, setSafeError, setSafeLoading]);
 
   return {
     directives,

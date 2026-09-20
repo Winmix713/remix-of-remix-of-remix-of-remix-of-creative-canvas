@@ -16,6 +16,7 @@ import { MetricCard, MetricGrid } from '../components/winmix/MetricCard';
 import { PageHeader } from '../components/winmix/PageHeader';
 import { StateProgress } from '../components/winmix/PanelState';
 import { CloudTierTab } from '../components/winmix/ops/CloudTierTab';
+import { PinGate } from '../components/winmix/ops/PinGate';
 import { OpsTabs, type TabDescriptor } from '../components/winmix/ops/OpsTabs';
 import { SettingsTab } from '../components/winmix/ops/SettingsTab';
 import { WeightsTab } from '../components/winmix/ops/WeightsTab';
@@ -159,16 +160,18 @@ export function PipelineOperationsDashboard() {
 
       {tab === 'cloud' ?
       <div role="tabpanel" id="ops-panel-cloud" aria-labelledby="ops-tab-cloud">
-          <CloudTierTab
-            league={currentLeague}
-            crossCheck={ops.crossCheck}
-            ingestToCloud={() => void ops.ingestToCloud()}
-            ingesting={ops.ingesting}
-            ingestResult={ops.ingestResult}
-            downloadFromCloud={() => void ops.downloadFromCloud(currentLeague)}
-            downloading={ops.downloading}
-            downloadResult={ops.downloadResult}
-          />
+          <PinGate>
+            <CloudTierTab
+              league={currentLeague}
+              crossCheck={ops.crossCheck}
+              ingestToCloud={() => void ops.ingestToCloud()}
+              ingesting={ops.ingesting}
+              ingestResult={ops.ingestResult}
+              downloadFromCloud={() => void ops.downloadFromCloud(currentLeague)}
+              downloading={ops.downloading}
+              downloadResult={ops.downloadResult}
+            />
+          </PinGate>
         </div> :
       null}
     </div>);
